@@ -1,6 +1,8 @@
 import google.generativeai as genai
 from google.oauth2.service_account import Credentials
 import gspread
+# 🛠️ CORRECTED IMPORTS: Removed set_text_format, set_data_validation, get_default_format
+from gspread_formatting import set_row_height, cellFormat, format_cell_range 
 from datetime import datetime
 import json
 import os
@@ -166,8 +168,6 @@ def generate_video_prompt(model, word_data):
     The conversation should begin right in the first second to get the audience attention.
 
     * Strictly no text or subtitles included in the video. 
-
-    *Format the response as JSON file ready to be copied into a video generation tool
     
     *Also Include the following details in your response:
     Scene Duration: 8 seconds
@@ -175,7 +175,6 @@ def generate_video_prompt(model, word_data):
     Illustration style:
     Use a warm, modern flat-vector illustration style with soft pastel colors, clean lines, and simple but expressive facial features. 
     Think of a style that could be used in educational flashcards or language-learning apps—playful yet clear, conveying both the action and the meaning.
-    *Strictly no text or subtitles in the video
 
     Audio:
     Characters say their lines exactly as in the scene description and match with their actions and they speak Finnish in Helsinki region accent
@@ -184,7 +183,6 @@ def generate_video_prompt(model, word_data):
     response = model.generate_content(prompt)
     return response.text.strip()
 
-# 🆕 NEW FUNCTION to generate the video caption separately
 def generate_video_caption(model, word_data):
     """Generate an engaging TikTok caption for the vocabulary word."""
     finnish_word = word_data['finnish_word']
@@ -232,16 +230,15 @@ def save_to_sheets(sheet, vocabulary_data):
     for item in vocabulary_data:
         example_sentence = f"{item.get('example_finnish', '')} ({item.get('example_english', '')})"
         
-        # 🆕 UPDATED COLUMN MAPPING: Added item.get('video_caption', '')
         row = [
-            current_date, # 'Date Added' (Column A)
+            current_date, 
             item.get('finnish_word', ''),
             item.get('english_translation', ''),
             item.get('category', ''),
-            item.get('level', ''), # NEW 'Level' column
+            item.get('level', ''), 
             example_sentence,
             item.get('video_prompt', ''),
-            item.get('video_caption', '') # 🆕 NEW 'Video Caption' column
+            item.get('video_caption', '')
         ]
         rows.append(row)
     
@@ -250,6 +247,32 @@ def save_to_sheets(sheet, vocabulary_data):
         print(f"Successfully added {len(rows)} **new** vocabulary words to Google Sheets")
     else:
         print("No new vocabulary words to add.")
+
+def apply_fixed_row_height(sheet, pixel_size=50):
+    """
+    Sets a fixed row height for all data rows (starting from row 2) 
+    and ensures text wrapping is disabled.
+    """
+    
+    # Set fixed row height (e.g., 50 pixels) for all rows from row 2 onwards
+    print(f"Applying fixed row height of {pixel_size} pixels...")
+    
+    # Set row height for rows 2 to the current last row
+    
+    # Get the total number of rows currently in the sheet
+    max_rows = sheet.row_count
+    
+    try:
+        # Set a fixed height for all rows from 2 to the end
+        set_row_height(sheet, f'2:{max_rows}', pixel_size)
+        
+        # Optionally, apply 'CLIP' text wrapping to prevent expansion
+        # This is the key to stopping the row height changing with content
+        clip_format = cellFormat(wrapText=False) 
+        format_cell_range(sheet, f'A2:{gspread.utils.rowcol_to_a1(max_rows, len(sheet.row_values(1)))}', clip_format)
+
+    except Exception as e:
+        print(f"Error applying row height: {e}")
 
 def main():
     """Main function to run the vocabulary generator"""
@@ -294,6 +317,8 @@ def main():
     
     print("Saving to Google Sheets...")
     save_to_sheets(sheet, vocabulary)
+
+    apply_fixed_row_height(sheet, pixel_size=50)
     
     print("\n🎉 **Complete!** Your Finnish vocabulary has been saved to Google Sheets.")
     print(f"Generated {len(vocabulary)} new, unique words with video prompts and captions.")
