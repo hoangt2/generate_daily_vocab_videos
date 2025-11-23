@@ -100,59 +100,82 @@ def get_existing_words(sheet):
         return set() 
 
 def generate_finnish_vocabulary(model, existing_words, count=10):
-    """Generate random Finnish words using Gemini, filtering out existing ones."""
-    
-    if existing_words:
-        existing_list = list(existing_words)[:5]
-        exclude_hint = f" Do NOT use any of these words: {', '.join(existing_list)}."
-    else:
-        exclude_hint = ""
-
-    # UPDATED PROMPT: Requesting Level (A1-B1)
-    prompt = f"""Generate {count} random Finnish vocabulary words suitable for daily learning between levels A1 to B1.
-    {exclude_hint}
-    For each word, provide:
-    1. The Finnish word
-    2. English translation
-    3. Category (e.g., noun, verb, adjective, daily life, food, nature, etc.)
-    4. **Level (A1, A2, or B1)**
-    5. A simple example sentence in Finnish with English translation
-    
-    Format the response as JSON array with objects containing: 
-    finnish_word, english_translation, category, **level**, example_finnish, example_english
-    
-    Make the words varied and useful for beginners to intermediate learners."""
-    
-    response = model.generate_content(prompt)
-    
-    # Parse the JSON response
-    text = response.text
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0]
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0]
-    
-    try:
-        vocabulary = json.loads(text.strip())
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON from model response: {e}")
-        print(f"Raw response text: {text[:200]}...")
-        return []
-    
-    # POST-PROCESSING: Filter out duplicates and ensure data structure
+    """
+    Generate random Finnish words using Gemini, filtering out existing ones.
+    Loops until the requested number of unique words is found.
+    """
     new_vocabulary = []
-    for item in vocabulary:
-        if 'finnish_word' not in item:
-            print(" ⚠️ Skipping item due to missing 'finnish_word' key.")
-            continue
-            
-        finnish_word = item['finnish_word'].strip().lower()
-        if finnish_word not in existing_words:
-            new_vocabulary.append(item)
-            existing_words.add(finnish_word)
+    attempts = 0
+    max_attempts = 5  # Prevent infinite loops
+    
+    while len(new_vocabulary) < count and attempts < max_attempts:
+        needed = count - len(new_vocabulary)
+        print(f"Generating {needed} words (Attempt {attempts + 1}/{max_attempts})...")
+
+        if existing_words:
+            # Convert set to list and take a sample to avoid huge prompts, 
+            # but enough to give the model a hint of what's there.
+            # Taking last 50 might be better than random 5 if we want to avoid recent ones,
+            # but random sample is okay. Let's just show a few.
+            existing_sample = list(existing_words)[-20:] if len(existing_words) > 20 else list(existing_words)
+            exclude_hint = f" Do NOT use any of these words: {', '.join(existing_sample)}."
         else:
-            print(f" ⚠️ Skipping duplicate word: {item['finnish_word']}")
+            exclude_hint = ""
+
+        # UPDATED PROMPT: Requesting Level (A1-B1)
+        prompt = f"""Generate {needed} random Finnish vocabulary words suitable for daily learning between levels A1 to B1.
+        {exclude_hint}
+        For each word, provide:
+        1. The Finnish word
+        2. English translation
+        3. Category (e.g., noun, verb, adjective, daily life, food, nature, etc.)
+        4. **Level (A1, A2, or B1)**
+        5. A simple example sentence in Finnish with English translation
+        
+        Format the response as JSON array with objects containing: 
+        finnish_word, english_translation, category, **level**, example_finnish, example_english
+        
+        Make the words varied and useful for beginners to intermediate learners."""
+        
+        try:
+            response = model.generate_content(prompt)
+            text = response.text
             
+            # Parse the JSON response
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            
+            batch_vocabulary = json.loads(text.strip())
+            
+            if not isinstance(batch_vocabulary, list):
+                print("Model did not return a list. Retrying...")
+                attempts += 1
+                continue
+
+            # POST-PROCESSING: Filter out duplicates and ensure data structure
+            for item in batch_vocabulary:
+                if 'finnish_word' not in item:
+                    continue
+                    
+                finnish_word = item['finnish_word'].strip().lower()
+                
+                # Check against global existing words AND words generated in this session
+                if finnish_word not in existing_words and not any(w['finnish_word'].lower() == finnish_word for w in new_vocabulary):
+                    new_vocabulary.append(item)
+                    existing_words.add(finnish_word) # Add to set to prevent duplicates in next loop iteration
+                else:
+                    print(f" ⚠️ Skipping duplicate word: {item['finnish_word']}")
+        
+        except Exception as e:
+            print(f"Error during generation attempt {attempts + 1}: {e}")
+        
+        attempts += 1
+
+    if len(new_vocabulary) < count:
+        print(f"⚠️ Warning: Only generated {len(new_vocabulary)} unique words out of {count} requested after {max_attempts} attempts.")
+
     return new_vocabulary
 
 def generate_video_prompt(model, word_data):
@@ -261,22 +284,38 @@ def apply_fixed_row_height(sheet, pixel_size=50):
     
     # Get the total number of rows currently in the sheet
     max_rows = sheet.row_count
-    
-    try:
-        # Set a fixed height for all rows from 2 to the end
-        set_row_height(sheet, f'2:{max_rows}', pixel_size)
-        
-        # Optionally, apply 'CLIP' text wrapping to prevent expansion
-        # This is the key to stopping the row height changing with content
-        clip_format = cellFormat(wrapText=False) 
-        format_cell_range(sheet, f'A2:{gspread.utils.rowcol_to_a1(max_rows, len(sheet.row_values(1)))}', clip_format)
-
-    except Exception as e:
-        print(f"Error applying row height: {e}")
-
 def main():
     """Main function to run the vocabulary generator"""
     
+    BACKUP_FILE = "backup_vocab.json"
+
+    # --- 1. Check for Backup ---
+    if os.path.exists(BACKUP_FILE):
+        print(f"⚠️ Found backup file '{BACKUP_FILE}'. Resuming from previous failed run...")
+        try:
+            with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                vocabulary = json.load(f)
+            
+            if vocabulary:
+                print(f"Loaded {len(vocabulary)} words from backup.")
+                print("Connecting to Google Sheets...")
+                sheet = setup_google_sheets()
+                
+                print("Saving to Google Sheets...")
+                save_to_sheets(sheet, vocabulary)
+                apply_fixed_row_height(sheet, pixel_size=50)
+                
+                # If successful, remove backup
+                os.remove(BACKUP_FILE)
+                print(f"✅ Backup file '{BACKUP_FILE}' deleted after successful save.")
+                print("\n🎉 **Complete!** Vocabulary restored from backup and saved.")
+                return
+            else:
+                print("Backup file was empty. Proceeding with normal generation.")
+        except Exception as e:
+            print(f"Error reading backup file: {e}. Proceeding with normal generation.")
+
+    # --- 2. Normal Generation Flow ---
     if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY is not set in environment variables/dotenv file.")
         return
@@ -291,7 +330,7 @@ def main():
     existing_words = get_existing_words(sheet)
     print(f"Found {len(existing_words)} existing words in the sheet.")
     
-    print("Generating Finnish vocabulary...")
+    print(f"Generating {VOCAB_COUNT} Finnish vocabulary words...")
     vocabulary = generate_finnish_vocabulary(model, existing_words, count=VOCAB_COUNT) 
     
     if not vocabulary:
@@ -300,28 +339,45 @@ def main():
         
     print(f"Generated {len(vocabulary)} unique words.")
     
-    print("Generating video prompts and captions...") # 🔄 Updated status message
+    print("Generating video prompts and captions...") 
     for item in vocabulary:
         word = item.get('finnish_word', 'Unknown Word')
         print(f"  Processing prompt for: {word}")
         
-        # 1. Generate Video Prompt (Original step)
+        # 1. Generate Video Prompt
         video_prompt = generate_video_prompt(model, item)
         item['video_prompt'] = video_prompt
         
-        # 2. 🆕 Generate Video Caption (New step)
+        # 2. Generate Video Caption
         print(f"  Processing caption for: {word}")
         video_caption = generate_video_caption(model, item)
-        item['video_caption'] = video_caption # Store the new caption
+        item['video_caption'] = video_caption 
         
-    
-    print("Saving to Google Sheets...")
-    save_to_sheets(sheet, vocabulary)
+    # --- 3. Save Backup before Sheets ---
+    print(f"Saving backup to '{BACKUP_FILE}' before uploading...")
+    try:
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(vocabulary, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Warning: Could not save backup file: {e}")
 
-    apply_fixed_row_height(sheet, pixel_size=50)
-    
-    print("\n🎉 **Complete!** Your Finnish vocabulary has been saved to Google Sheets.")
-    print(f"Generated {len(vocabulary)} new, unique words with video prompts and captions.")
+    # --- 4. Save to Sheets ---
+    print("Saving to Google Sheets...")
+    try:
+        save_to_sheets(sheet, vocabulary)
+        apply_fixed_row_height(sheet, pixel_size=50)
+        
+        # If successful, remove backup
+        if os.path.exists(BACKUP_FILE):
+            os.remove(BACKUP_FILE)
+            print(f"Backup file '{BACKUP_FILE}' deleted.")
+            
+        print("\n🎉 **Complete!** Your Finnish vocabulary has been saved to Google Sheets.")
+        print(f"Generated {len(vocabulary)} new, unique words with video prompts and captions.")
+        
+    except Exception as e:
+        print(f"\n❌ Error saving to Google Sheets: {e}")
+        print(f"The generated data is saved in '{BACKUP_FILE}'. Fix the issue and run the script again to retry saving.")
 
 if __name__ == "__main__":
     main()
